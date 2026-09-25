@@ -37,6 +37,15 @@ import (
 
 const (
 	maxJSONRPCErrorRequestBody = 1 << 20
+
+	// Non-secret API-key attribution forwarded to remote MCP backends so a
+	// downstream server can attribute actions to the authenticated caller
+	// without joining back to Obot. These carry the same values Obot already
+	// records in audit metadata (see auditLogMetadataForPrincipal); they never
+	// carry the API-key secret. Obot always sets or clears them on the outbound
+	// request, so a client cannot spoof its own attribution.
+	headerAPIKeyName = "X-Obot-Api-Key-Name"
+	headerAPIKeyID   = "X-Obot-Api-Key-Id"
 )
 
 var (
@@ -69,6 +78,24 @@ func auditLogMetadataForPrincipal(metadata map[string]string, user user.Info) ma
 	result[principal.APIKeyIDExtra] = strconv.FormatUint(uint64(attribution.ID), 10)
 	result[principal.APIKeyNameExtra] = attribution.Name
 	return result
+}
+
+// apiKeyAttributionHeaders returns the non-secret API-key attribution headers to
+// forward to a remote MCP backend, or nil when the caller did not authenticate
+// with an API key. The name and id are the same values recorded in audit
+// metadata; the API-key secret is never included.
+func apiKeyAttributionHeaders(u user.Info) map[string]string {
+	attribution, ok := principal.APIKeyAttributionFromUser(u)
+	if !ok {
+		return nil
+	}
+	headers := map[string]string{
+		headerAPIKeyID: strconv.FormatUint(uint64(attribution.ID), 10),
+	}
+	if attribution.Name != "" {
+		headers[headerAPIKeyName] = attribution.Name
+	}
+	return headers
 }
 
 func writeMCPJSONRPCError(w http.ResponseWriter, req *http.Request, rpcErr error) bool {
@@ -298,10 +325,12 @@ func (h *Handler) Proxy(req api.Context) error {
 			return nil
 		}
 
+		attributionHeaders := apiKeyAttributionHeaders(req.User)
+
 		(&httputil.ReverseProxy{
 			Transport: client.Transport,
 			Rewrite: func(r *httputil.ProxyRequest) {
-				rewriteProxyRequest(r, u)
+				rewriteProxyRequest(r, u, attributionHeaders)
 			},
 			ModifyResponse: func(resp *http.Response) error {
 				rewriteMCPAuthResponse(req, resp)
@@ -339,12 +368,21 @@ func (h *Handler) Proxy(req api.Context) error {
 	return nil
 }
 
-func rewriteProxyRequest(r *httputil.ProxyRequest, upstreamURL *url.URL) {
+func rewriteProxyRequest(r *httputil.ProxyRequest, upstreamURL *url.URL, attributionHeaders map[string]string) {
 	// These headers may authenticate the client to Obot and must not cross the
 	// trust boundary to the upstream MCP server. The transport adds any
 	// explicitly configured upstream credentials after this rewrite.
 	for _, header := range []string{"Authorization", "Cookie", "Proxy-Authorization", "X-API-Key"} {
 		r.Out.Header.Del(header)
+	}
+
+	// Forward Obot-verified, non-secret caller attribution to the backend.
+	// Set (or clear) these unconditionally so a client cannot spoof them: any
+	// inbound copy is removed first, then Obot's own value is applied.
+	r.Out.Header.Del(headerAPIKeyName)
+	r.Out.Header.Del(headerAPIKeyID)
+	for name, value := range attributionHeaders {
+		r.Out.Header.Set(name, value)
 	}
 
 	// SetXForwarded preserves the X-Forwarded-For handling that ReverseProxy

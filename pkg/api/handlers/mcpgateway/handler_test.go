@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -16,8 +17,10 @@ import (
 	mmmcpconfig "github.com/obot-platform/mmmcp/config"
 	"github.com/obot-platform/obot/pkg/api"
 	obotmcp "github.com/obot-platform/obot/pkg/mcp"
+	"github.com/obot-platform/obot/pkg/principal"
 	"github.com/obot-platform/obot/pkg/safehttp"
 	"golang.org/x/oauth2"
+	"k8s.io/apiserver/pkg/authentication/user"
 )
 
 func TestCompositeUpstreamClientIdentity(t *testing.T) {
@@ -148,8 +151,11 @@ func TestProxyStripsInboundGatewayCredentials(t *testing.T) {
 		name                      string
 		configuredUpstreamHeaders http.Header
 		tokenSource               oauth2.TokenSource
+		attributionHeaders        map[string]string
 		wantAuthorization         string
 		wantAPIKey                string
+		wantAPIKeyName            string
+		wantAPIKeyID              string
 	}{
 		{
 			name: "non-authorization upstream credential",
@@ -175,6 +181,40 @@ func TestProxyStripsInboundGatewayCredentials(t *testing.T) {
 			tokenSource:       oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "oauth-upstream-token"}),
 			wantAuthorization: "Bearer oauth-upstream-token",
 		},
+		{
+			name: "forwards api key attribution",
+			configuredUpstreamHeaders: http.Header{
+				"X-Filesapi-Key": {"files-api-key"},
+			},
+			attributionHeaders: map[string]string{
+				headerAPIKeyName: "delivery-copilot-dev",
+				headerAPIKeyID:   "14",
+			},
+			wantAPIKeyName: "delivery-copilot-dev",
+			wantAPIKeyID:   "14",
+		},
+		{
+			name: "overwrites client-supplied attribution",
+			configuredUpstreamHeaders: http.Header{
+				"X-Filesapi-Key": {"files-api-key"},
+			},
+			attributionHeaders: map[string]string{
+				headerAPIKeyName: "delivery-copilot-dev",
+				headerAPIKeyID:   "14",
+			},
+			// The request below spoofs both headers; Obot must replace them.
+			wantAPIKeyName: "delivery-copilot-dev",
+			wantAPIKeyID:   "14",
+		},
+		{
+			name: "clears client-supplied attribution when caller is not an api key",
+			configuredUpstreamHeaders: http.Header{
+				"X-Filesapi-Key": {"files-api-key"},
+			},
+			// No attributionHeaders: the spoofed inbound headers must be dropped.
+			wantAPIKeyName: "",
+			wantAPIKeyID:   "",
+		},
 	}
 
 	for _, tt := range tests {
@@ -197,7 +237,7 @@ func TestProxyStripsInboundGatewayCredentials(t *testing.T) {
 					TokenSource: tt.tokenSource,
 				}),
 				Rewrite: func(req *httputil.ProxyRequest) {
-					rewriteProxyRequest(req, upstreamURL)
+					rewriteProxyRequest(req, upstreamURL, tt.attributionHeaders)
 				},
 			})
 			defer proxy.Close()
@@ -210,6 +250,10 @@ func TestProxyStripsInboundGatewayCredentials(t *testing.T) {
 			request.Header.Set("Cookie", "obot_access_token=local-session-secret")
 			request.Header.Set("Proxy-Authorization", "Bearer obot-proxy-token")
 			request.Header.Set("X-API-Key", "obot-api-key")
+			// Spoofed inbound attribution: Obot must never trust these; it
+			// overwrites them with its own value or clears them entirely.
+			request.Header.Set(headerAPIKeyName, "spoofed-name")
+			request.Header.Set(headerAPIKeyID, "999999")
 
 			response, err := http.DefaultClient.Do(request)
 			if err != nil {
@@ -235,6 +279,61 @@ func TestProxyStripsInboundGatewayCredentials(t *testing.T) {
 			}
 			if got.Get("X-API-Key") != tt.wantAPIKey {
 				t.Fatalf("X-API-Key = %q, want %q", got.Get("X-API-Key"), tt.wantAPIKey)
+			}
+			if got.Get(headerAPIKeyName) != tt.wantAPIKeyName {
+				t.Fatalf("%s = %q, want %q", headerAPIKeyName, got.Get(headerAPIKeyName), tt.wantAPIKeyName)
+			}
+			if got.Get(headerAPIKeyID) != tt.wantAPIKeyID {
+				t.Fatalf("%s = %q, want %q", headerAPIKeyID, got.Get(headerAPIKeyID), tt.wantAPIKeyID)
+			}
+		})
+	}
+}
+
+func TestAPIKeyAttributionHeaders(t *testing.T) {
+	tests := []struct {
+		name string
+		user user.Info
+		want map[string]string
+	}{
+		{
+			name: "no api key",
+			user: &user.DefaultInfo{Name: "someone"},
+			want: nil,
+		},
+		{
+			name: "named api key",
+			user: &user.DefaultInfo{
+				Name: "someone",
+				Extra: map[string][]string{
+					principal.APIKeyIDExtra:   {"14"},
+					principal.APIKeyNameExtra: {"delivery-copilot-dev"},
+				},
+			},
+			want: map[string]string{
+				headerAPIKeyID:   "14",
+				headerAPIKeyName: "delivery-copilot-dev",
+			},
+		},
+		{
+			name: "unnamed api key omits name header",
+			user: &user.DefaultInfo{
+				Name: "someone",
+				Extra: map[string][]string{
+					principal.APIKeyIDExtra: {"14"},
+				},
+			},
+			want: map[string]string{
+				headerAPIKeyID: "14",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := apiKeyAttributionHeaders(tt.user)
+			if !maps.Equal(got, tt.want) {
+				t.Fatalf("apiKeyAttributionHeaders() = %v, want %v", got, tt.want)
 			}
 		})
 	}
